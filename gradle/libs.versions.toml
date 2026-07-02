@@ -12,6 +12,7 @@ lifecycle = "2.10.0"
 activityCompose = "1.13.0"
 savedstate = "1.5.0"
 hilt = "2.60"
+hiltNavigationCompose = "1.2.0"
 coroutines = "1.11.0"
 playServicesWearable = "20.0.1"
 wearCompose = "1.6.2"
@@ -38,8 +39,10 @@ androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "u
 
 hilt-android = { group = "com.google.dagger", name = "hilt-android", version.ref = "hilt" }
 hilt-compiler = { group = "com.google.dagger", name = "hilt-android-compiler", version.ref = "hilt" }
+hilt-navigation-compose = { group = "androidx.hilt", name = "hilt-navigation-compose", version.ref = "hiltNavigationCompose" }
 
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-play-services = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-play-services", version.ref = "coroutines" }
 
 play-services-wearable = { group = "com.google.android.gms", name = "play-services-wearable", version.ref = "playServicesWearable" }
 androidx-wear = { group = "androidx.wear", name = "wear", version.ref = "wearToolkit" }
