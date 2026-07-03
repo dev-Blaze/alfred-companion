@@ -1,6 +1,7 @@
 package com.yshah.alfred.wear.di
 
 import android.content.Context
+import com.yshah.alfred.wear.capture.WearSpeechCapture
 import com.yshah.alfred.wear.datalayer.DataLayerSender
 import dagger.Module
 import dagger.Provides
@@ -16,4 +17,9 @@ object WearCaptureModule {
     @Singleton
     fun provideDataLayerSender(@ApplicationContext context: Context): DataLayerSender =
         DataLayerSender(context)
+
+    @Provides
+    @Singleton
+    fun provideWearSpeechCapture(@ApplicationContext context: Context): WearSpeechCapture =
+        WearSpeechCapture(context)
 }

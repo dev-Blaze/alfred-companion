@@ -1,26 +1,25 @@
 package com.yshah.alfred.wear.capture
 
-import android.app.Activity
-import android.content.Intent
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
-import android.speech.RecognizerIntent
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.wear.compose.material3.Button
@@ -31,6 +30,14 @@ import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
 class CaptureActivity : ComponentActivity() {
+
+    private val viewModel: CaptureViewModel by viewModels()
+
+    private val micPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) viewModel.startCapture(viewModel.ui.value.mode)
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -39,76 +46,99 @@ class CaptureActivity : ComponentActivity() {
             }
         }
     }
+
+    // Capture-on-open: every foreground entry starts listening in the current mode (task by
+    // default) — the whole point of the watch app is raise-wrist → speak, no taps needed.
+    override fun onStart() {
+        super.onStart()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            viewModel.startCapture(viewModel.ui.value.mode)
+        } else {
+            micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    override fun onStop() {
+        // Don't hold the mic while backgrounded; an in-flight send is unaffected.
+        viewModel.cancelCapture()
+        super.onStop()
+    }
 }
 
 @Composable
 private fun CaptureScreen(viewModel: CaptureViewModel = hiltViewModel()) {
-    val status by viewModel.status.collectAsState()
-
-    // Which mode the in-flight speech capture belongs to. rememberSaveable because the system
-    // speech activity fully covers ours and may cause it to be recreated before the result lands.
-    var pendingType by rememberSaveable { mutableStateOf<String?>(null) }
-
-    val speechLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val type = pendingType
-        pendingType = null
-        val text = result.data
-            ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            ?.firstOrNull()
-            .orEmpty()
-        if (result.resultCode == Activity.RESULT_OK && type != null && text.isNotBlank()) {
-            viewModel.send(type = type, text = text)
-        }
-    }
-
-    fun startCapture(type: String) {
-        pendingType = type
-        // Speech capture is delegated to the system recognizer activity (round Wear OS mic UI)
-        // rather than a raw SpeechRecognizer — it owns the mic, permissions, and error UX.
-        speechLauncher.launch(
-            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(
-                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-                )
-                putExtra(
-                    RecognizerIntent.EXTRA_PROMPT,
-                    if (type == "task") "Task for Alfred" else "Note for Alfred",
-                )
-            }
-        )
-    }
+    val ui by viewModel.ui.collectAsState()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp, vertical = 16.dp),
+            .padding(horizontal = 20.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
     ) {
-        Text(statusText(status))
-        Button(
-            onClick = { startCapture("task") },
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text("Task")
+        Text(
+            text = statusText(ui.phase),
+            style = MaterialTheme.typography.titleMedium,
+            textAlign = TextAlign.Center,
+        )
+        if (ui.transcript.isNotEmpty()) {
+            Text(
+                text = ui.transcript,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
-        FilledTonalButton(
-            onClick = { startCapture("note") },
+        Row(
             modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Note")
+            ModeChip(
+                label = "Task",
+                selected = ui.mode == "task",
+                modifier = Modifier.weight(1f),
+                onClick = { viewModel.startCapture("task") },
+            )
+            ModeChip(
+                label = "Note",
+                selected = ui.mode == "note",
+                modifier = Modifier.weight(1f),
+                onClick = { viewModel.startCapture("note") },
+            )
         }
     }
 }
 
-private fun statusText(status: SendStatus): String = when (status) {
-    is SendStatus.Idle -> "Alfred"
-    is SendStatus.Sending -> "Sending…"
+/**
+ * Selected mode renders as a filled button, the other as tonal. Tapping either (re)starts
+ * listening in that mode — which doubles as the retry affordance after an error.
+ */
+@Composable
+private fun ModeChip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    if (selected) {
+        Button(onClick = onClick, modifier = modifier) {
+            Text(label, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
+    } else {
+        FilledTonalButton(onClick = onClick, modifier = modifier) {
+            Text(label, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+private fun statusText(phase: CapturePhase): String = when (phase) {
+    is CapturePhase.Idle -> "Alfred"
+    is CapturePhase.Listening -> "Listening…"
+    is CapturePhase.Sending -> "Sending…"
     // Deliberately not "Sent" — the capture is locally queued and syncs when the phone is
     // reachable, which is the designed offline behavior, not a failure.
-    is SendStatus.Queued -> "Captured ✓"
-    is SendStatus.Error -> "Error: ${status.message}"
+    is CapturePhase.Queued -> "Captured ✓"
+    is CapturePhase.Error -> phase.message
 }
