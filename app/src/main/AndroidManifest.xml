@@ -2,7 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature android:name="android.hardware.type.watch" android:required="true" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- No RECORD_AUDIO: speech capture is delegated to the system recognizer activity
+         (RecognizerIntent.ACTION_RECOGNIZE_SPEECH), which holds the mic permission itself. -->
 
     <application
         android:name=".AlfredWearApplication"
