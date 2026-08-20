@@ -1,9 +1,14 @@
 package com.yshah.alfred.wear.capture
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -14,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -21,28 +27,57 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.wear.compose.material3.AppScaffold
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.MaterialTheme
+import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
-import dagger.hilt.android.AndroidEntryPoint
+import com.yshah.alfred.wear.datalayer.MODE_NOTE
+import com.yshah.alfred.wear.datalayer.MODE_TASK
+import com.yshah.alfred.wear.datalayer.sendCapture
 
-@AndroidEntryPoint
 class CaptureActivity : ComponentActivity() {
 
-    private val viewModel: CaptureViewModel by viewModels()
+    private val viewModel: CaptureViewModel by viewModels {
+        viewModelFactory {
+            initializer {
+                val app = applicationContext
+                CaptureViewModel(
+                    speechCapture = WearSpeechCapture(app),
+                    transmit = { type, text -> sendCapture(app, type, text) },
+                )
+            }
+        }
+    }
 
     private val micPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) viewModel.startCapture(viewModel.ui.value.mode)
+            if (granted) {
+                // onStart may already have started capture if the OEM's permission UI stopped
+                // this activity; startCapture is idempotent while listening, so this is safe
+                // on the devices where it doesn't.
+                viewModel.startCapture(viewModel.ui.value.mode)
+            } else {
+                // Once shouldShowRequestPermissionRationale goes false after a denial, further
+                // requests return instantly without any UI — settings is the only way back.
+                viewModel.onPermissionDenied(
+                    permanent = !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO),
+                )
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                CaptureScreen()
+                AppScaffold {
+                    ScreenScaffold {
+                        CaptureScreen(viewModel, onOpenSettings = ::openAppSettings)
+                    }
+                }
             }
         }
     }
@@ -59,15 +94,31 @@ class CaptureActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        // Don't hold the mic while backgrounded; an in-flight send is unaffected.
+        // Don't hold the mic while backgrounded. Anything transcribed so far is sent rather
+        // than dropped (see CaptureViewModel.cancelCapture); an in-flight send is unaffected.
         viewModel.cancelCapture()
         super.onStop()
+    }
+
+    private fun openAppSettings() {
+        startActivity(
+            Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", packageName, null),
+            )
+        )
     }
 }
 
 @Composable
-private fun CaptureScreen(viewModel: CaptureViewModel = hiltViewModel()) {
+private fun CaptureScreen(viewModel: CaptureViewModel, onOpenSettings: () -> Unit) {
     val ui by viewModel.ui.collectAsState()
+
+    // A watch blanks its screen ~15s after the last touch, and this app is designed never to be
+    // touched — speaking doesn't count. Without this the display sleeps mid-sentence, the
+    // activity stops, and the capture is lost. Released as soon as we're no longer capturing so
+    // the watch can sleep normally.
+    KeepScreenOn(ui.phase is CapturePhase.Listening || ui.phase is CapturePhase.Sending)
 
     Column(
         modifier = Modifier
@@ -91,23 +142,43 @@ private fun CaptureScreen(viewModel: CaptureViewModel = hiltViewModel()) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            ModeChip(
-                label = "Task",
-                selected = ui.mode == "task",
-                modifier = Modifier.weight(1f),
-                onClick = { viewModel.startCapture("task") },
-            )
-            ModeChip(
-                label = "Note",
-                selected = ui.mode == "note",
-                modifier = Modifier.weight(1f),
-                onClick = { viewModel.startCapture("note") },
-            )
+        val phase = ui.phase
+        if (phase is CapturePhase.Error && phase.needsSettings) {
+            Button(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) {
+                Text("Open settings", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ModeChip(
+                    label = "Task",
+                    selected = ui.mode == MODE_TASK,
+                    modifier = Modifier.weight(1f),
+                    onClick = { viewModel.startCapture(MODE_TASK) },
+                )
+                ModeChip(
+                    label = "Note",
+                    selected = ui.mode == MODE_NOTE,
+                    modifier = Modifier.weight(1f),
+                    onClick = { viewModel.startCapture(MODE_NOTE) },
+                )
+            }
         }
+    }
+}
+
+@Composable
+private fun KeepScreenOn(active: Boolean) {
+    val window = LocalActivity.current?.window
+    DisposableEffect(active, window) {
+        if (active) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
     }
 }
 

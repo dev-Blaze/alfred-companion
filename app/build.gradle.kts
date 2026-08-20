@@ -4,8 +4,6 @@ plugins {
     // Kotlin compilation itself is built into AGP 9+ — no org.jetbrains.kotlin.android plugin needed.
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.ksp)
-    alias(libs.plugins.hilt)
 }
 
 // Same keystore.properties/keystore/ pair as the phone app (both gitignored) — GMS only delivers
@@ -17,6 +15,13 @@ val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
         keystorePropertiesFile.inputStream().use { load(it) }
+    } else {
+        // Without this the build quietly falls back to the debug key and produces an APK that
+        // installs, opens, records speech, reports "Captured ✓" — and delivers nothing.
+        logger.warn(
+            "\n*** keystore.properties not found — signing with the DEBUG key. ***\n" +
+                "*** This APK will NOT deliver captures to the phone app.      ***\n"
+        )
     }
 }
 
@@ -30,32 +35,18 @@ android {
         applicationId = "com.yshah.alfred"
         minSdk = 30
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.2.1"
     }
 
-    signingConfigs {
-        create("release") {
-            if (keystorePropertiesFile.exists()) {
-                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("storePassword")
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("keyPassword")
-            }
+    if (keystorePropertiesFile.exists()) {
+        signingConfigs.create("release") {
+            storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+            storePassword = keystoreProperties.getProperty("storePassword")
+            keyAlias = keystoreProperties.getProperty("keyAlias")
+            keyPassword = keystoreProperties.getProperty("keyPassword")
         }
-    }
-
-    buildTypes {
-        release {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
-            }
-        }
-        debug {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
-            }
-        }
+        buildTypes.all { signingConfig = signingConfigs.getByName("release") }
     }
 
     buildFeatures {
@@ -66,52 +57,33 @@ android {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
+
+    // android.util.Log is a stub in JVM unit tests and throws unless it returns defaults.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
+    // play-services-wearable drags in androidx.fragment 1.1.0, and nothing else on this
+    // classpath raises it. Fragment < 1.3.0 mishandles ActivityResult permission callbacks —
+    // which is exactly how the mic permission is requested — and lint fails the release build
+    // over it. A constraint rather than a dependency: the floor matters, the artifact isn't used.
+    constraints {
+        implementation(libs.androidx.fragment)
+    }
+
     implementation(platform(libs.androidx.compose.bom))
 
-    implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.lifecycle.runtime.ktx)
-    implementation(libs.androidx.lifecycle.viewmodel.compose)
-    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.activity.compose)
-    implementation(libs.androidx.savedstate)
-
+    implementation(libs.androidx.lifecycle.viewmodel)
     implementation(libs.androidx.compose.ui)
-    implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
-    debugImplementation(libs.androidx.compose.ui.tooling)
-
-    implementation(libs.androidx.wear)
-    implementation(libs.wear.compose.foundation)
     implementation(libs.wear.compose.material3)
-    implementation(libs.wear.compose.navigation)
     implementation(libs.play.services.wearable)
-
-    implementation(libs.wear.tiles)
-    implementation(libs.wear.tiles.material)
-    implementation(libs.wear.protolayout)
-    implementation(libs.wear.protolayout.material)
-
-    implementation(libs.hilt.android)
-    ksp(libs.hilt.compiler)
-    implementation(libs.hilt.navigation.compose)
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.play.services)
 
     testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.test.ext.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-}
-
-// Hilt's shaded XProcessing (unshaded since Dagger 2.57) bundles kotlin-metadata-jvm, which must
-// be >= the Kotlin compiler's metadata format version or KSP annotation processing fails with
-// "Provided Metadata instance has version X, while maximum supported version is Y" — same bug hit
-// in the phone app (alfred/), fixed the same way here.
-configurations.all {
-    resolutionStrategy {
-        force("org.jetbrains.kotlin:kotlin-metadata-jvm:${libs.versions.kotlin.get()}")
-    }
+    testImplementation(libs.kotlinx.coroutines.test)
 }

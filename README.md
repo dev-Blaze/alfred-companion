@@ -11,15 +11,21 @@ Built with Kotlin, Compose for Wear OS, and Hilt for a OnePlus Watch 4, but shou
 ## How it works
 
 - **Capture**: on-watch speech recognition with silence auto-stop — talking stops, sending starts. No taps needed after opening the app.
-- **Relay, not direct send**: captures travel over the Bluetooth Data Layer to the phone app, which owns the webhook call. The watch needs no Wi-Fi and no webhook credentials.
-- **Offline-safe**: out of phone range? The capture is queued on the watch ("Captured ✓") and syncs automatically when the phone reconnects.
+- **Relay, not direct send**: captures travel over the Bluetooth Data Layer to the phone app, which owns the webhook call. The watch needs no Wi-Fi of its own and no webhook credentials.
+- **Queued, not dropped**: once a transcript exists it is buffered on the watch ("Captured ✓") and syncs automatically the next time the phone is reachable — being out of range doesn't lose it.
+
+> **On recognition and connectivity:** speech recognition is the one part that may need a network. The app prefers the on-device recognizer when the watch has one, but falls back to the default recognizer, which streams audio to a server. Tethered to your phone that's fine — Wear OS proxies the connection over Bluetooth. Fully out of range with no Wi-Fi *and* no on-device language model, recognition fails before there's a transcript to queue.
 
 ## Requirements
 
 - A Wear OS 3+ watch paired to an Android phone.
 - The [Alfred phone app](https://github.com/dev-Blaze/alfred/releases) **v0.3.0 or newer** installed and configured on that phone (it receives the watch's captures).
 
-> **Building from source?** The Data Layer only delivers between apps with the same application ID *and* signing certificate. Both this app and the phone app must be signed with the same keystore — debug builds of one won't talk to release builds of the other.
+> **Building from source?** The Data Layer only delivers between apps with the same application ID *and* signing certificate. Both this app and the phone app must be signed with the same keystore — debug builds of one won't talk to release builds of the other. Without `keystore.properties` the build still succeeds, signed with the debug key, and the resulting APK captures speech perfectly while delivering nothing; it prints a warning, so watch for it.
+
+### The phone-side contract
+
+The watch writes one DataItem per capture at `/alfred/capture/{sessionId}`, carrying `type` (`task` or `note`), `text`, and `sessionId`. The phone app must **delete each DataItem once it has consumed it** — that delete is load-bearing on both sides. A DataItem lives until someone removes it, so skipping the delete means every capture ever made replays into the webhook whenever the phone app is reinstalled and re-syncs from the watch.
 
 ## Installing the APK on your watch
 
