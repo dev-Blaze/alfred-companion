@@ -1,150 +1,163 @@
 package com.yshah.alfred.wear.capture
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.yshah.alfred.wear.datalayer.MODE_TASK
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 
-sealed class CapturePhase {
-    data object Idle : CapturePhase()
-    data object Listening : CapturePhase()
-    data object Sending : CapturePhase()
-    data object Queued : CapturePhase()
-    /** [needsSettings] when the only way to recover is the system app-info screen. */
-    data class Error(val message: String, val needsSettings: Boolean = false) : CapturePhase()
-}
-
 data class CaptureUiState(
-    val mode: String = MODE_TASK,
-    val phase: CapturePhase = CapturePhase.Idle,
-    val transcript: String = "",
-)
+    val mode: String = "task",
+    val listening: Boolean = false,
+    val message: String = "",
+    val needsSettings: Boolean = false,
+    val records: List<CaptureRecord> = emptyList(),
+) {
+    val draft: CaptureRecord? get() = records.firstOrNull { it.status == "draft" }
+}
 
 class CaptureViewModel(
     private val speechCapture: SpeechCapture,
-    private val transmit: suspend (type: String, text: String) -> Unit,
+    private val store: CaptureStore,
+    private val hasMicPermission: () -> Boolean,
+    private val transmit: suspend (CaptureRecord) -> Unit,
 ) : ViewModel() {
-
-    private val _ui = MutableStateFlow(CaptureUiState())
-    val ui: StateFlow<CaptureUiState> = _ui.asStateFlow()
-
-    // Bumped on every new capture. A send's UI updates are dropped once it's stale, so a slow
-    // send can't clobber a newer capture's state. The send itself is deliberately never
-    // cancelled — a capture the user was told we took must not be lost because they reopened
-    // the app, and each capture writes its own DataItem path so concurrent sends can't collide.
+    private val _ui = MutableStateFlow(CaptureUiState(records = store.records.value))
+    val ui = _ui.asStateFlow()
     private var generation = 0
+    private val inFlight = mutableSetOf<String>()
 
-    /** Starts (or restarts) listening in the given mode. Requires RECORD_AUDIO already granted. */
-    fun startCapture(mode: String) {
-        // The permission-grant round trip drives onStart and the result callback, and tapping
-        // the selected chip mid-listen re-enters here. Restarting would destroy a recognizer
-        // bound milliseconds ago and rebind, which reliably yields ERROR_CLIENT/BUSY.
-        val current = _ui.value
-        if (current.phase == CapturePhase.Listening && current.mode == mode) return
+    init {
+        viewModelScope.launch { store.records.collect { records -> _ui.update { it.copy(records = records) } } }
+    }
 
-        if (!speechCapture.isAvailable()) {
-            _ui.value = CaptureUiState(mode, CapturePhase.Error("No speech recognizer"))
-            return
+    fun selectMode(mode: String) {
+        require(mode == "task" || mode == "note")
+        interruptCapture()
+        if (save { store.change { records -> records.map { if (it.status == "draft") it.copy(type = mode) else it } } }) {
+            _ui.update { it.copy(mode = mode) }
         }
-        generation++
-        _ui.value = CaptureUiState(mode = mode, phase = CapturePhase.Listening)
-        speechCapture.start { event ->
-            when (event) {
-                is SpeechCapture.Event.Partial ->
-                    _ui.update { it.copy(transcript = event.text) }
-                is SpeechCapture.Event.Final ->
-                    if (event.text.isBlank()) {
-                        _ui.update {
-                            it.copy(phase = CapturePhase.Error("Didn't catch that"), transcript = "")
-                        }
-                    } else {
-                        send(mode, event.text)
+    }
+
+    /** Permission is checked here too, including re-record attempts and settings returns. */
+    fun startCapture() {
+        if (!hasMicPermission()) { onPermissionDenied(); return }
+        if (_ui.value.listening) return
+        if (!speechCapture.isAvailable()) { showError("No speech recognizer. You can type a draft."); return }
+        val record = store.records.value.firstOrNull { it.status == "draft" }
+            ?: CaptureRecord(type = _ui.value.mode)
+        if (!save { store.change { records -> if (records.any { it.requestId == record.requestId }) records else records + record } }) return
+        val token = ++generation
+        _ui.update { it.copy(listening = true, message = "", needsSettings = false) }
+        try {
+            speechCapture.start { event ->
+                if (token != generation || !_ui.value.listening) return@start
+                when (event) {
+                    is SpeechCapture.Event.Partial -> saveText(record.requestId, event.text)
+                    is SpeechCapture.Event.Final -> {
+                        if (event.text.isNotBlank()) saveText(record.requestId, event.text)
+                        interruptCapture()
                     }
-                is SpeechCapture.Event.Failed ->
-                    _ui.update { it.copy(phase = CapturePhase.Error(event.message), transcript = "") }
+                    is SpeechCapture.Event.Failed -> {
+                        interruptCapture()
+                        showError(event.message + ". Review the retained draft or record again.")
+                    }
+                }
             }
+        } catch (_: SecurityException) {
+            interruptCapture()
+            onPermissionDenied()
+        } catch (_: Exception) {
+            interruptCapture()
+            showError("Speech could not start. Draft retained.")
         }
     }
 
-    /**
-     * Stops listening — e.g. when the activity leaves the foreground, which on a watch usually
-     * means the screen timed out or the user turned their wrist mid-sentence. Whatever was
-     * transcribed so far is sent rather than discarded: a truncated capture that lands beats a
-     * complete one that vanishes silently.
-     */
-    fun cancelCapture() {
+    fun stopListening() = speechCapture.stop()
+
+    /** Lifecycle interruption never authorizes a send. Invalidate callbacks before cancellation. */
+    fun interruptCapture() {
+        generation++
         speechCapture.cancel()
-        val state = _ui.value
-        if (state.phase == CapturePhase.Listening && state.transcript.isNotBlank()) {
-            Log.d(TAG, "backgrounded mid-capture, salvaging ${state.transcript.length} chars")
-            send(state.mode, state.transcript)
-        } else {
-            _ui.update {
-                if (it.phase == CapturePhase.Listening) it.copy(phase = CapturePhase.Idle) else it
-            }
+        _ui.update { it.copy(listening = false) }
+    }
+
+    fun editText(text: String) {
+        if (text.length > 50_000) { showError("Draft must be at most 50,000 characters"); return }
+        interruptCapture()
+        val draft = store.records.value.firstOrNull { it.status == "draft" }
+        if (draft != null) saveText(draft.requestId, text)
+        else save { store.change { it + CaptureRecord(type = _ui.value.mode, text = text) } }
+    }
+
+    fun cancelDraft() {
+        interruptCapture()
+        if (save { store.change { it.filterNot { record -> record.status == "draft" } } }) {
+            _ui.update { it.copy(message = "Draft cancelled") }
         }
     }
 
-    /** Denial leaves the app inert, so say so — the screen would otherwise just read "Alfred". */
-    fun onPermissionDenied(permanent: Boolean) {
-        _ui.value = CaptureUiState(
-            mode = _ui.value.mode,
-            phase = CapturePhase.Error("Mic access needed", needsSettings = permanent),
-        )
+    fun onPermissionDenied() {
+        _ui.update { it.copy(message = "Microphone access needed to record. Enable it in settings or type a draft.", needsSettings = true) }
     }
 
-    private fun send(mode: String, text: String) {
-        val sendGeneration = generation
-        _ui.update { it.copy(phase = CapturePhase.Sending, transcript = text) }
+    fun send(id: String) {
+        val record = store.records.value.firstOrNull { it.requestId == id } ?: return
+        if (id in inFlight || (record.status != "draft" && !record.canRetry)) return
+        if (record.text.isBlank()) { showError("Add text before sending"); return }
+        interruptCapture()
+        var pending: CaptureRecord? = null
+        if (!save { store.update(id) { current ->
+            if (current.status != "draft" && !current.canRetry) current
+            else current.copy(status = "pending", message = "", attempt = current.attempt + 1)
+                .also { pending = it }
+        } }) return
+        val transfer = pending ?: return
+        inFlight += id
         viewModelScope.launch {
             try {
-                withTimeout(SEND_TIMEOUT_MS) { transmit(mode, text) }
-                // putDataItem() succeeding only confirms local buffering, not phone receipt —
-                // "Queued" is the honest status until an ack path exists (deferred to v2).
-                updateIfCurrent(sendGeneration) { it.copy(phase = CapturePhase.Queued) }
-                delay(STATUS_RESET_MS)
-                updateIfCurrent(sendGeneration) {
-                    it.copy(phase = CapturePhase.Idle, transcript = "")
-                }
-            } catch (e: TimeoutCancellationException) {
-                // Must precede the CancellationException rethrow below — this one is a real
-                // failure to report, not the scope tearing down.
-                Log.w(TAG, "send timed out", e)
-                updateIfCurrent(sendGeneration) {
-                    it.copy(phase = CapturePhase.Error("Send timed out"), transcript = "")
-                }
+                withTimeout(10_000) { transmit(transfer) }
+                updateTransfer(id, "local_queued", "Waiting for phone receipt. Safe to close the app.")
+            } catch (_: TimeoutCancellationException) {
+                updateTransfer(id, "unknown", "Transfer timed out; receipt unknown. Retry uses the same request ID.")
             } catch (e: CancellationException) {
+                // Durable pending record recovers as unknown on the next process start.
                 throw e
-            } catch (e: Exception) {
-                Log.w(TAG, "send failed", e)
-                updateIfCurrent(sendGeneration) {
-                    it.copy(phase = CapturePhase.Error(e.message ?: "Send failed"), transcript = "")
-                }
+            } catch (_: Exception) {
+                updateTransfer(id, "unknown", "Transfer could not be confirmed. Retry uses the same request ID.")
+            } finally {
+                inFlight -= id
             }
         }
     }
 
-    private fun updateIfCurrent(sendGeneration: Int, block: (CaptureUiState) -> CaptureUiState) {
-        if (sendGeneration == generation) _ui.update(block)
+    private fun updateTransfer(id: String, status: String, message: String) = save {
+        store.update(id) { if (it.status == "pending") it.copy(status = status, message = message) else it }
     }
+
+    private fun saveText(id: String, text: String) {
+        if (text.length <= 50_000) {
+            save { store.update(id) { it.copy(text = text) } }
+        }
+    }
+
+    private fun save(block: () -> Unit): Boolean = try {
+        block()
+        _ui.update { it.copy(records = store.records.value) }
+        true
+    } catch (_: Exception) {
+        showError("Watch storage could not save this change. Keep this screen open and try again.")
+        false
+    }
+
+    private fun showError(message: String) { _ui.update { it.copy(message = message) } }
 
     override fun onCleared() {
-        speechCapture.cancel()
+        interruptCapture()
         super.onCleared()
-    }
-
-    private companion object {
-        const val TAG = "AlfredCapture"
-        const val STATUS_RESET_MS = 2_500L
-        const val SEND_TIMEOUT_MS = 10_000L
     }
 }

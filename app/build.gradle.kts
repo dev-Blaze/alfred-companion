@@ -8,20 +8,12 @@ plugins {
 
 // Same keystore.properties/keystore/ pair as the phone app (both gitignored) — GMS only delivers
 // Data Layer events between nodes whose apps share BOTH applicationId and signing certificate,
-// so the watch app must be signed with the phone app's release key. That applies to debug builds
-// too: the phone runs a release-signed build, so a debug-signed watch build would silently fail
-// to deliver exactly like the original com.yshah.alfred.wear/debug-key build did.
+// so release deployments must use the same key on phone and watch. Debug keeps Android's
+// normal debug signing, matching the phone project's debug behavior.
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
         keystorePropertiesFile.inputStream().use { load(it) }
-    } else {
-        // Without this the build quietly falls back to the debug key and produces an APK that
-        // installs, opens, records speech, reports "Captured ✓" — and delivers nothing.
-        logger.warn(
-            "\n*** keystore.properties not found — signing with the DEBUG key. ***\n" +
-                "*** This APK will NOT deliver captures to the phone app.      ***\n"
-        )
     }
 }
 
@@ -35,8 +27,8 @@ android {
         applicationId = "com.yshah.alfred"
         minSdk = 30
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.2.1"
+        versionCode = 4
+        versionName = "0.3.1"
     }
 
     if (keystorePropertiesFile.exists()) {
@@ -46,7 +38,7 @@ android {
             keyAlias = keystoreProperties.getProperty("keyAlias")
             keyPassword = keystoreProperties.getProperty("keyPassword")
         }
-        buildTypes.all { signingConfig = signingConfigs.getByName("release") }
+        buildTypes.getByName("release") { signingConfig = signingConfigs.getByName("release") }
     }
 
     buildFeatures {

@@ -1,140 +1,178 @@
 package com.yshah.alfred.wear.capture
 
+import com.yshah.alfred.wear.datalayer.capturePath
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.advanceUntilIdle
-import kotlinx.coroutines.test.resetMain
-import kotlinx.coroutines.test.runCurrent
-import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.*
 import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
+import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 
-/**
- * The ViewModel is the only branching logic in the app, and the failure it guards against is
- * silent: a stale send writing an error over a capture that is actually fine. Everything else
- * needs a real recognizer or Play Services, so it stays out of the JVM.
- */
 @OptIn(ExperimentalCoroutinesApi::class)
 class CaptureViewModelTest {
-
     private val dispatcher = StandardTestDispatcher()
-    private val capture = FakeSpeechCapture()
+    private val speech = FakeSpeech()
+    private var permission = true
+    private var disk = emptyList<CaptureRecord>()
+    private val store = CaptureStore { disk = it }
+    @Before fun before() = Dispatchers.setMain(dispatcher)
+    @After fun after() = Dispatchers.resetMain()
+    private fun model(transmit: suspend (CaptureRecord) -> Unit = {}) =
+        CaptureViewModel(speech, store, { permission }, transmit)
 
-    @Before fun setUp() = Dispatchers.setMain(dispatcher)
-    @After fun tearDown() = Dispatchers.resetMain()
-
-    private fun viewModel(transmit: suspend (String, String) -> Unit = { _, _ -> }) =
-        CaptureViewModel(capture, transmit)
-
-    @Test
-    fun `a new capture started mid-send is never clobbered by the old send`() = runTest(dispatcher) {
-        val inFlight = CompletableDeferred<Unit>()
-        val vm = viewModel { _, _ -> inFlight.await() }
-
-        vm.startCapture("task")
-        capture.emit(SpeechCapture.Event.Final("first one"))
-        assertEquals(CapturePhase.Sending, vm.ui.value.phase)
-
-        // User speaks again before the first send resolves.
-        vm.startCapture("note")
-        assertEquals(CapturePhase.Listening, vm.ui.value.phase)
-
-        inFlight.complete(Unit)
-        advanceUntilIdle()
-
-        assertEquals("the stale send overwrote a live capture", CapturePhase.Listening, vm.ui.value.phase)
-        assertEquals("note", vm.ui.value.mode)
+    @Test fun `interruption persists draft and ignores late final without sending`() = runTest(dispatcher) {
+        val sent = mutableListOf<CaptureRecord>()
+        val vm = model { sent += it }
+        vm.startCapture()
+        val stale = speech.callback!!
+        speech.emit(SpeechCapture.Event.Partial("call dentist"))
+        vm.interruptCapture()
+        stale(SpeechCapture.Event.Final("incorrect late result"))
+        runCurrent()
+        assertTrue(sent.isEmpty())
+        assertEquals("call dentist", disk.single().text)
+        assertEquals("draft", disk.single().status)
+        val restored = CaptureViewModel(speech, CaptureStore(disk), { permission }) {}
+        assertEquals(vm.ui.value.draft, restored.ui.value.draft)
     }
 
-    @Test
-    fun `switching mode during the Captured window does not surface a cancellation error`() =
-        runTest(dispatcher) {
-            val vm = viewModel()
-
-            vm.startCapture("task")
-            capture.emit(SpeechCapture.Event.Final("buy milk"))
-            // runCurrent, not advanceUntilIdle — the latter would burn through the 2.5s reset
-            // delay and land on Idle, skipping the window this test is about.
-            runCurrent()
-            assertEquals(CapturePhase.Queued, vm.ui.value.phase)
-
-            // Inside the 2.5s status reset, which used to be cancelled and caught as an Exception.
-            vm.startCapture("note")
-            advanceUntilIdle()
-
-            assertEquals(CapturePhase.Listening, vm.ui.value.phase)
-        }
-
-    @Test
-    fun `backgrounding mid-sentence sends what was heard instead of dropping it`() =
-        runTest(dispatcher) {
-            val sent = mutableListOf<Pair<String, String>>()
-            val vm = viewModel { type, text -> sent += type to text }
-
-            vm.startCapture("task")
-            capture.emit(SpeechCapture.Event.Partial("call the dentist"))
-            vm.cancelCapture()
-            advanceUntilIdle()
-
-            assertEquals(listOf("task" to "call the dentist"), sent)
-        }
-
-    @Test
-    fun `backgrounding before any words leaves nothing to send`() = runTest(dispatcher) {
-        val sent = mutableListOf<Pair<String, String>>()
-        val vm = viewModel { type, text -> sent += type to text }
-
-        vm.startCapture("task")
-        vm.cancelCapture()
+    @Test fun `final requires send and correction keeps capture metadata`() = runTest(dispatcher) {
+        val sent = mutableListOf<CaptureRecord>()
+        val vm = model { sent += it }
+        vm.startCapture()
+        val original = disk.single()
+        speech.emit(SpeechCapture.Event.Final("buy mil"))
+        runCurrent()
+        assertTrue(sent.isEmpty())
+        vm.editText("buy milk")
+        vm.send(original.requestId)
         advanceUntilIdle()
-
-        assertEquals(emptyList<Pair<String, String>>(), sent)
-        assertEquals(CapturePhase.Idle, vm.ui.value.phase)
+        assertEquals("buy milk", sent.single().text)
+        assertEquals(original.requestId, sent.single().requestId)
+        assertEquals(original.capturedAt, sent.single().capturedAt)
+        assertEquals(original.timeZone, sent.single().timeZone)
+        assertEquals("local_queued", disk.single().status)
     }
 
-    @Test
-    fun `restarting the same mode while listening does not rebind the recognizer`() =
-        runTest(dispatcher) {
-            val vm = viewModel()
-
-            vm.startCapture("task")
-            vm.startCapture("task")
-
-            assertEquals("recognizer was restarted mid-listen", 1, capture.startCount)
+    @Test fun `timeout is unknown and retry uses same payload and path`() = runTest(dispatcher) {
+        val sent = mutableListOf<CaptureRecord>()
+        val vm = model {
+            sent += it
+            if (sent.size == 1) CompletableDeferred<Unit>().await()
         }
+        vm.startCapture()
+        speech.emit(SpeechCapture.Event.Final("buy milk"))
+        val id = disk.single().requestId
+        vm.send(id)
+        advanceUntilIdle()
+        assertEquals("unknown", disk.single().status)
+        assertEquals("buy milk", disk.single().text)
+        vm.send(id)
+        advanceUntilIdle()
+        assertEquals(sent[0].copy(attempt = sent[1].attempt), sent[1])
+        assertEquals(capturePath(sent[0].requestId), capturePath(sent[1].requestId))
+    }
 
-    @Test
-    fun `a send that never resolves times out instead of hanging on Sending`() =
-        runTest(dispatcher) {
-            val vm = viewModel { _, _ -> CompletableDeferred<Unit>().await() }
-
-            vm.startCapture("task")
-            capture.emit(SpeechCapture.Event.Final("something"))
-            // Virtual time, so this returns as soon as the withTimeout fires — it does not
-            // spend 10 real seconds, and it can't hang on the deferred that never completes.
-            advanceUntilIdle()
-
-            val phase = vm.ui.value.phase
-            assertTrue("expected an error, got $phase", phase is CapturePhase.Error)
+    @Test fun `failure retains transcript and result arriving during transfer wins`() = runTest(dispatcher) {
+        var fail = true
+        val vm = model { item ->
+            if (fail) error("offline")
+            store.receive("/alfred/result/${item.requestId}", item.requestId, "success", "Done")
         }
+        vm.editText("remember this")
+        val id = disk.single().requestId
+        vm.send(id)
+        advanceUntilIdle()
+        assertEquals("remember this", disk.single().text)
+        assertEquals("unknown", disk.single().status)
+        fail = false
+        vm.send(id)
+        advanceUntilIdle()
+        assertEquals("success", disk.single().status)
+        store.receive("/alfred/result/$id", id, "accepted", "Saved on phone")
+        assertEquals("Done", disk.single().message)
+    }
 
-    private class FakeSpeechCapture : SpeechCapture {
-        var startCount = 0
-        private var onEvent: ((SpeechCapture.Event) -> Unit)? = null
+    @Test fun `every recording attempt checks permission and preserves draft`() = runTest(dispatcher) {
+        val vm = model()
+        vm.editText("retained")
+        permission = false
+        vm.startCapture()
+        assertEquals(0, speech.starts)
+        assertTrue(vm.ui.value.needsSettings)
+        permission = true
+        vm.startCapture()
+        assertEquals(1, speech.starts)
+        vm.interruptCapture()
+        permission = false
+        vm.startCapture()
+        assertEquals(1, speech.starts)
+        assertEquals("retained", disk.single().text)
+    }
 
+    @Test fun `speech finalization failure preserves partial and cancel prevents stale writes`() = runTest(dispatcher) {
+        val vm = model()
+        vm.startCapture()
+        speech.emit(SpeechCapture.Event.Partial("partial"))
+        vm.stopListening()
+        assertEquals(1, speech.stops)
+        speech.emit(SpeechCapture.Event.Failed("Speech finalization timed out"))
+        assertFalse(vm.ui.value.listening)
+        assertEquals("partial", disk.single().text)
+        vm.startCapture()
+        val stale = speech.callback!!
+        vm.cancelDraft()
+        stale(SpeechCapture.Event.Final("stale"))
+        assertTrue(disk.isEmpty())
+    }
+
+    @Test fun `result validation rejects mismatched unknown and draft requests`() {
+        val item = CaptureRecord(text = "draft")
+        store.change { listOf(item) }
+        assertFalse(store.receive("/alfred/result/other", item.requestId, "success", "Done"))
+        assertFalse(store.receive("/alfred/result/${item.requestId}", item.requestId, "surprise", "Done"))
+        assertFalse(store.receive("/alfred/result/${item.requestId}", item.requestId, "success", "Done"))
+        assertEquals("draft", disk.single().status)
+    }
+
+    @Test fun `storage failure never transmits or publishes acceptance`() = runTest(dispatcher) {
+        var sends = 0
+        val broken = CaptureStore { error("disk full") }
+        val vm = CaptureViewModel(speech, broken, { true }) { sends++ }
+        vm.editText("important")
+        vm.startCapture()
+        advanceUntilIdle()
+        assertEquals(0, sends)
+        assertEquals(0, speech.starts)
+        assertTrue(vm.ui.value.message.contains("storage"))
+        assertTrue(broken.records.value.isEmpty())
+    }
+
+    @Test fun `receipt racing a retry cannot be overwritten by pending`() = runTest(dispatcher) {
+        val record = CaptureRecord(text = "buy milk", status = "local_queued")
+        store.change { listOf(record) }
+        var sends = 0
+        val vm = model { sends++ }
+        speech.onCancel = {
+            store.receive("/alfred/result/${record.requestId}", record.requestId, "success", "Done")
+        }
+        vm.send(record.requestId)
+        advanceUntilIdle()
+        assertEquals(0, sends)
+        assertEquals("success", disk.single().status)
+    }
+
+    private class FakeSpeech : SpeechCapture {
+        var onCancel: () -> Unit = {}
+        var callback: ((SpeechCapture.Event) -> Unit)? = null
+        var starts = 0
+        var stops = 0
         override fun isAvailable() = true
-        override fun start(onEvent: (SpeechCapture.Event) -> Unit) {
-            startCount++
-            this.onEvent = onEvent
-        }
-        override fun cancel() { onEvent = null }
-
-        fun emit(event: SpeechCapture.Event) = onEvent!!.invoke(event)
+        override fun start(onEvent: (SpeechCapture.Event) -> Unit) { starts++; callback = onEvent }
+        override fun stop() { stops++ }
+        override fun cancel() { callback = null; onCancel() }
+        fun emit(event: SpeechCapture.Event) = callback!!.invoke(event)
     }
 }
